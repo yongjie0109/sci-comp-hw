@@ -1,0 +1,149 @@
+function aaa_gamma
+% AAA-lite approximation to f(x)=Gamma(x) on [-3.5,4.5]
+% Same visual style as Fig.4.2, with red markers for support points.
+
+clc; clear; close all;
+%% ------------------ sampling & data (avoid poles) ------------------ %%
+f = @(x) gamma(x);
+xL = -3.5; 
+xR = 4.5;
+M = 400;                             % dense samples for robustness
+Z = linspace(xL, xR, M).';
+poles = [0 -1 -2 -3];
+hole = 2e-3;                             % skip tiny neighborhoods of poles
+for p = poles, Z = Z(abs(Z - p) > hole); end
+F = f(Z);
+
+%% ------------------ AAA core (scaled Loewner) ---------------------- %%
+tol = 1e-11;
+mcap = 12;                                % ~ type (11,11), close to Fig. 4.2
+[zs, fs, ws] = aaa_core_scaled(Z, F, tol, mcap);
+
+% safe evaluator r(x): uses barycentric N./D, but snaps to f_j at support points
+r_eval = @(xq) bary_eval_scaled_safe(xq, zs, ws, fs);
+
+%% ------------------ plot r(x) segmented by poles ------------------- %%
+edges = sort([xL, xR, poles]);
+figure('Name','AAA approximation r(x) to Gamma(x)'); hold on
+for k = 1:numel(edges)-1
+    L = edges(k); R = edges(k+1);
+    Ls = L + (k>1)*hole;                  % trim around interior poles
+    Rs = R - (k<numel(edges)-1)*hole;
+    if Ls >= Rs, continue; end
+    xx = linspace(Ls, Rs, 2500).';
+    rr = r_eval(xx);
+    plot(xx, rr, 'b-', 'LineWidth', 1.2, 'HandleVisibility', 'off');  % keep legend clean
+end
+xlim([xL xR]); ylim([-8 8]);
+xlabel('x'); ylabel('r(x)');
+title('AAA approximation r(x) to \Gamma(x) on [-3.5, 4.5]');
+grid on
+
+%% ------------------ overlay support points (legend only this) ------ %%
+% Use f_j at supports; clip to visible band so points don't disappear off-axes
+yy_pts = real(r_eval(zs));  % r(z_j) = f_j
+scatter(zs, yy_pts, 35, 'filled', ...
+    'MarkerFaceColor', [0.9 0.1 0.1], ...
+    'DisplayName', 'support points', ...
+    'Clipping','on');       
+
+legend('Location','best');
+
+end
+
+% ================== CORE: scaled Loewner (optimized) ================== %
+function [z, f, w] = aaa_core_scaled(Z, F, tol, mcap)
+% Inputs:
+%   Z, F : Sample points and function values
+%   tol  : Relative error tolerance for stopping
+%   mcap : Maximum number of support points
+% Outputs:
+%   z, f : Support points and their corresponding function values
+%   w    : Barycentric weights
+
+M = numel(Z);
+S = false(M,1);              % Boolean mask for selected support points
+z = []; f = []; w = [];
+rZ = zeros(M,1);             % Current approximation r evaluated at Z
+Cfull = [];                  % Accumulated Cauchy matrix (Z vs {z_j}), updated column-wise to save recomputation
+
+% Precompute denominator for relative error to avoid repeated calls to max(1,abs(F))
+Fscale = max(1, abs(F));
+
+for m = 1:mcap
+    % ---- 1) Greedy step: find the point with the maximum residual among non-support points ----
+    resid = abs(F - rZ); 
+    resid(S) = -Inf;
+    [~, idx] = max(resid);
+    S(idx) = true;
+
+    % ---- 2) Update support points and their corresponding function values ----
+    zj = Z(idx);  fj = F(idx);
+    z  = [z; zj];
+    f  = [f; fj];
+
+    % ---- 3) Build / update Cauchy matrix ----
+    % C (remaining rows) and Cfull (all rows) are appended column-wise (rank-1 update)
+    newCol_full = 1 ./ (Z - zj);              % 1/(Z - z_m) for all Z w.r.t. new support point
+    if isempty(Cfull)
+        Cfull = newCol_full;
+    else
+        Cfull = [Cfull, newCol_full];         %#ok<AGROW>
+    end
+
+    % Mask for remaining (non-support) rows
+    maskR = ~S;
+    Zm = Z(maskR);  Fm = F(maskR);
+
+    % Extract corresponding rows of C from Cfull
+    C = Cfull(maskR, :);                      % (M-m) x m
+
+    % ---- 4) Scaled Loewner matrix: A = S_F*C - C*S_f ----
+    % Use elementwise multiplication instead of diag to save time and memory
+    % A_ij = C_ij * (Fm_i - f_j)
+    % ⇒ can be written using implicit expansion:
+    A = C .* (Fm - f.');                      % (M-m) x m
+
+    % ---- 5) Compute smallest singular vector -> weights w ----
+    % For small m (~20 or less), full SVD is efficient;
+    % for large M, use svds(A,1,'smallest') instead
+    [~,~,V] = svd(A, 'econ');
+    w = V(:, end);
+    w = w / norm(w);
+
+    % ---- 6) Evaluate r on all Z: r = N./D with N=Cfull*(w.*f), D=Cfull*w ----
+    N = Cfull * (w .* f);
+    D = Cfull *  w;
+    rZ = N ./ D;
+
+    % ---- 7) Relative error stopping criterion ----
+    % More stable; avoids large errors near poles (where |rZ| may blow up)
+    rel = max( abs(F - rZ) ./ Fscale );
+    if rel < tol
+        break
+    end
+end
+end
+
+% ================== Evaluator: numerically safe at support points (optimized) ================== %
+function R = bary_eval_scaled_safe(xq, z, w, f)
+% Vectorized barycentric evaluation; directly returns f_j at support points to avoid 0/0 cancellation
+xq = xq(:);
+C  = 1 ./ (xq - z.');             % Implicit expansion to avoid for-loops
+N  = C * (w .* f);
+D  = C *  w;
+R  = N ./ D;
+
+% Snap to exact support points (using ismembertol for numerical robustness)
+snapTol = 1e-12;
+idx = ismembertol(xq, z, snapTol, 'DataScale', 1);
+if any(idx)
+    % For each hit, find the nearest matching support point index
+    % (since only few matches, loop is acceptable)
+    for k = find(idx).'
+        [~, jmin] = min(abs(xq(k) - z));
+        R(k) = f(jmin);
+    end
+end
+end
+
